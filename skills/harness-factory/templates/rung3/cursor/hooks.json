@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {"command": ".harness/hooks/protect-paths.sh --agent cursor", "matcher": "Write|Delete", "timeout": 30, "failClosed": true}
+    ],
+    "beforeShellExecution": [
+      {"command": ".harness/hooks/guard-bash.sh --agent cursor", "timeout": 30, "failClosed": true}
+    ]
+  }
+}

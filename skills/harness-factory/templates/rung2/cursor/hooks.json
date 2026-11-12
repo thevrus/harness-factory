@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "hooks": {
+    "afterFileEdit": [
+      {"command": ".harness/hooks/mark-dirty.sh --agent cursor", "timeout": 10}
+    ],
+    "stop": [
+      {"command": ".harness/hooks/require-evidence.sh --agent cursor", "timeout": 120, "loop_limit": 1}
+    ]
+  }
+}

@@ -1,0 +1,117 @@
+# Factory monitor (harness rung 5). No model runs here: metrics and regression
+# detection are deterministic (.harness/bin/metrics.py). Same lane split as the
+# agent loops: the measure job reads GitHub data (PR titles and bodies are
+# untrusted) with read-only permissions and emits a structured finding; the
+# file job validates it with .harness/bin/agent-output.py and opens at most one
+# issue per run, deduplicated by its Monitor-Key line.
+#
+# Kill switch: repository variable AGENT_ENABLED must be "true".
+
+name: agent-monitor
+
+on:
+  schedule:
+    - cron: "41 6 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: agent-monitor
+  cancel-in-progress: false
+
+jobs:
+  measure:
+    if: vars.AGENT_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      checks: read
+    outputs:
+      found: ${{ steps.metrics.outputs.found }}
+    steps:
+      - name: Kill switch (vars.AGENT_ENABLED)
+        env:
+          AGENT_ENABLED: ${{ vars.AGENT_ENABLED }}
+        run: |
+          if [ "${AGENT_ENABLED:-}" != "true" ]; then
+            echo "::error::AGENT_ENABLED is not 'true'; agent workflows are paused."
+            exit 1
+          fi
+
+      - name: Check out default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .harness
+
+      - name: Compute metrics and regressions
+        id: metrics
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p monitor-out
+          python3 .harness/bin/metrics.py --repo "$REPO" --window-days 7 --no-ledger \
+            --json-out monitor-out/metrics.json --findings-out monitor-out/finding.json
+          if [ -f monitor-out/finding.json ]; then echo "found=true" >> "$GITHUB_OUTPUT"; else echo "found=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Upload metrics
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: agent-monitor
+          path: monitor-out/
+          if-no-files-found: error
+          retention-days: 90
+
+  file:
+    needs: measure
+    if: vars.AGENT_ENABLED == 'true' && needs.measure.outputs.found == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Kill switch (vars.AGENT_ENABLED)
+        env:
+          AGENT_ENABLED: ${{ vars.AGENT_ENABLED }}
+        run: |
+          if [ "${AGENT_ENABLED:-}" != "true" ]; then
+            echo "::error::AGENT_ENABLED is not 'true'; agent workflows are paused."
+            exit 1
+          fi
+
+      - name: Check out default branch (validator)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .harness
+
+      - name: Download finding
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: agent-monitor
+          path: monitor-out
+
+      - name: Validate and file at most one issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 .harness/bin/agent-output.py incident --input monitor-out/finding.json \
+            --run-url "$RUN_URL" --title-out title.txt --body-out body.md
+          key="$(jq -r '.key' monitor-out/finding.json)"
+          case "$key" in *[!0-9a-f]*|'') echo "::error::invalid key"; exit 1 ;; esac
+          existing="$(gh api -X GET search/issues -f q="repo:$REPO is:issue is:open label:\"agent:incident\" \"Monitor-Key: $key\" in:body" --jq '.total_count')"
+          if [ "$existing" != "0" ]; then
+            echo "::notice::an open incident already carries Monitor-Key $key"; exit 0
+          fi
+          gh api "repos/$REPO/issues" -F title=@title.txt -F body=@body.md -f "labels[]=agent:incident" > /dev/null
+          echo "Filed: $(cat title.txt)"

@@ -1,0 +1,3 @@
+# harness-factory: local state and backups (ledger.jsonl and installed.json are committed)
+.harness/.state/
+*.harness-bak

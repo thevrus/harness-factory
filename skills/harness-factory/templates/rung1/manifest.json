@@ -1,0 +1,54 @@
+{
+  "rung": 1,
+  "name": "Legible",
+  "requires_config": [],
+  "files": [
+    {
+      "src": "agents.commands.md",
+      "dest": "AGENTS.md",
+      "strategy": "md-section",
+      "marker": "commands"
+    },
+    {
+      "src": "agents.context.md",
+      "dest": "AGENTS.md",
+      "strategy": "md-section",
+      "marker": "context",
+      "once": true
+    },
+    {
+      "src": "harness.README.md",
+      "dest": ".harness/README.md",
+      "strategy": "create"
+    },
+    {
+      "src": "gitignore.lines",
+      "dest": ".gitignore",
+      "strategy": "line-append"
+    },
+    {
+      "src": "claude.md.lines",
+      "dest": "CLAUDE.md",
+      "strategy": "line-append",
+      "agent": "claude",
+      "aliases": {
+        "@AGENTS.md": [
+          "@./AGENTS.md"
+        ]
+      },
+      "skip_if_same_file": "AGENTS.md"
+    },
+    {
+      "src": "gitignore.claude.lines",
+      "dest": ".gitignore",
+      "strategy": "line-append",
+      "agent": "claude"
+    },
+    {
+      "src": "gemini/settings.context.json",
+      "dest": ".gemini/settings.json",
+      "strategy": "json-merge",
+      "agent": "gemini"
+    }
+  ]
+}

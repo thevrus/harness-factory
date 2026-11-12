@@ -1,0 +1,25 @@
+{
+  "rung": 4,
+  "name": "First loop",
+  "_comment": [
+    "For the orchestrator: rung 4 installs ONE loop. The advance skill writes config key first_loop as an object with exactly one non-empty flag:",
+    "  \"first_loop\": {\"review\": \"yes\", \"triage\": \"\"}   or   {\"review\": \"\", \"triage\": \"yes\"}",
+    "The installer's `when` skips an entry whose config value is empty, so a single string value (review|triage) cannot select between files; that is why the key is an object.",
+    "Workflow entries are adapters (\"agent\": \"claude\"): only their marked AGENT STEP is vendor-specific. Everything else here is core.",
+    ".harness/maintainers.txt ships with a header only; hf_install.py sync writes config maintainers into its harness:config block."
+  ],
+  "requires_config": ["first_loop"],
+  "files": [
+    {"src": ".github/workflows/agent-review.yml", "dest": ".github/workflows/agent-review.yml", "strategy": "create", "when": "first_loop.review", "agent": "claude"},
+    {"src": ".github/workflows/agent-triage.yml", "dest": ".github/workflows/agent-triage.yml", "strategy": "create", "when": "first_loop.triage", "agent": "claude"},
+    {"src": ".harness/prompts/review.md", "dest": ".harness/prompts/review.md", "strategy": "create", "when": "first_loop.review"},
+    {"src": ".harness/schemas/review.schema.json", "dest": ".harness/schemas/review.schema.json", "strategy": "create", "when": "first_loop.review"},
+    {"src": ".harness/prompts/triage.md", "dest": ".harness/prompts/triage.md", "strategy": "create", "when": "first_loop.triage"},
+    {"src": ".harness/schemas/triage.schema.json", "dest": ".harness/schemas/triage.schema.json", "strategy": "create", "when": "first_loop.triage"},
+    {"src": ".harness/triage-labels.txt", "dest": ".harness/triage-labels.txt", "strategy": "line-append"},
+    {"src": ".harness/maintainers.txt", "dest": ".harness/maintainers.txt", "strategy": "line-append"},
+    {"src": ".harness/bin/strip-hidden.py", "dest": ".harness/bin/strip-hidden.py", "mode": "0755", "strategy": "create"},
+    {"src": ".harness/bin/agent-output.py", "dest": ".harness/bin/agent-output.py", "mode": "0755", "strategy": "create"},
+    {"src": ".harness/docs/first-loop.md", "dest": ".harness/docs/first-loop.md", "strategy": "create"}
+  ]
+}

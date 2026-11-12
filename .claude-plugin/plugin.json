@@ -1,0 +1,11 @@
+{
+  "name": "harness-factory",
+  "displayName": "Harness Factory",
+  "version": "0.1.0",
+  "description": "Audit a repository's readiness for coding agents, then assemble its harness and software factory one verified rung at a time.",
+  "author": { "name": "thevrus", "url": "https://github.com/thevrus" },
+  "homepage": "https://github.com/thevrus/harness-factory",
+  "repository": "https://github.com/thevrus/harness-factory",
+  "license": "MIT",
+  "keywords": ["harness", "software-factory", "agent-readiness", "audit", "automation"]
+}

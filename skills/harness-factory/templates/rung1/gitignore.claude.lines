@@ -1,0 +1,2 @@
+# harness-factory: "don't ask again" approvals store full command lines here, inline secrets included
+.claude/settings.local.json

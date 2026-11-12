@@ -1,0 +1,56 @@
+# harness.rules: Codex command rules installed by harness-factory.
+# Harness-owned file; put your own rules in another .rules file.
+# Loaded only when this project's .codex/ layer is trusted.
+# Rules match an exact argument prefix (Codex rules docs), so they catch the
+# plain forms only; .harness/hooks/guard-bash.sh (PreToolUse) parses the rest,
+# and GitHub branch protection is what enforces.
+# Rules are documented as controlling commands Codex runs outside the
+# sandbox; whether "forbidden" also stops a sandboxed run is UNVERIFIED.
+# Check with: codex execpolicy check --rules .codex/rules/harness.rules -- gh pr merge 1
+
+prefix_rule(
+    pattern = ["gh", "pr", "merge"],
+    decision = "forbidden",
+    justification = "Merging is a human decision. Open the PR and ask a maintainer to merge.",
+    match = ["gh pr merge 12 --squash"],
+)
+
+prefix_rule(
+    pattern = ["gh", "repo", "sync"],
+    decision = "forbidden",
+    justification = "Syncing can move protected branches. Ask a maintainer.",
+)
+
+prefix_rule(
+    pattern = ["git", "push", ["origin", "upstream"], ["{{default_branch}}", "HEAD:{{default_branch}}", "+{{default_branch}}", "refs/heads/{{default_branch}}", "HEAD:refs/heads/{{default_branch}}"]],
+    decision = "forbidden",
+    justification = "Do not push to {{default_branch}}. Push a feature branch and open a PR.",
+    match = ["git push origin {{default_branch}}", "git push origin HEAD:{{default_branch}}"],
+    not_match = ["git push origin feature-x"],
+)
+
+prefix_rule(
+    pattern = ["git", "push", ["--all", "--mirror", "--force", "-f"]],
+    decision = "forbidden",
+    justification = "Bulk or forced pushes can rewrite protected branches. Push one feature branch.",
+)
+
+# Unattended automation is switched on by a person. "prompt" asks the human;
+# the hook blocks these for Codex, so the stricter verdict applies. Prefix
+# rules cannot see a label value after an issue number, so the agent:ready
+# label is left to the hook.
+prefix_rule(
+    pattern = ["gh", "variable", ["set", "delete"], "AGENT_ENABLED"],
+    decision = "prompt",
+    justification = "A person turns automation on or off. Ask a maintainer to change AGENT_ENABLED.",
+    match = ["gh variable set AGENT_ENABLED --body true"],
+    not_match = ["gh variable list"],
+)
+
+prefix_rule(
+    pattern = ["gh", "workflow", ["run", "enable"], ["agent-implement.yml", "agent-triage.yml", "agent-review.yml", "agent-monitor.yml", "agent-implement", "agent-triage", "agent-review", "agent-monitor"]],
+    decision = "prompt",
+    justification = "A person starts the agent workflows. Ask a maintainer to run it.",
+    match = ["gh workflow run agent-implement.yml -f issue=3"],
+    not_match = ["gh workflow run ci.yml"],
+)

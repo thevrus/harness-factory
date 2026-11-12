@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "deny": [
+      "Shell(gh:pr merge*)",
+      "Shell(gh:pr review*--approve*)",
+      "Shell(gh:api*merge*)",
+      "Shell(git:push* {{default_branch}})",
+      "Shell(git:push* {{default_branch}} *)",
+      "Shell(git:push*:{{default_branch}})",
+      "Shell(git:push*:{{default_branch}} *)",
+      "Shell(git:push*refs/heads/{{default_branch}}*)",
+      "Shell(git:push*--all*)",
+      "Shell(git:push*--mirror*)",
+      "Shell(gh:variable set*AGENT_ENABLED*)",
+      "Shell(gh:variable delete*AGENT_ENABLED*)",
+      "Shell(gh:issue edit*agent:ready*)",
+      "Shell(gh:issue create*agent:ready*)",
+      "Shell(gh:workflow run*agent-*)",
+      "Shell(gh:workflow enable*agent-*)",
+      "Shell(gh:api*actions/workflows/agent-*)",
+      "Write(.harness/acceptance/**)"
+    ]
+  }
+}

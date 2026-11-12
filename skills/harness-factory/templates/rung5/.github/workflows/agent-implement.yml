@@ -1,0 +1,715 @@
+# Agent implementation lane (harness rung 5, factory).
+#
+# Starts only when a login listed in .harness/maintainers.txt applies the
+# agent:ready label, or dispatches: gh workflow run agent-implement.yml -f issue=N
+# The maintainer list is read from the default branch, never from the event
+# or from the ref a dispatch names.
+#
+# Jobs:
+#   gate      no model, read-only: kill switch, maintainer check, issue state,
+#             work-in-progress limit.
+#   wip-note  no model, issues: write: neutral note when the WIP limit is hit.
+#   claim     no model, contents: write: pushes agent/issue-<n> without force.
+#             First push wins; a second run is rejected and stops.
+#   implement model key, read-only token: the agent edits the working tree and
+#             runs gates.sh and diff-guard.sh. Its changes leave as a patch.
+#             gates.sh runs agent-written tests in the same job as the Claude
+#             process that holds the model key. CLAUDE_CODE_SUBPROCESS_ENV_SCRUB
+#             is the only barrier between that code and the key: use a
+#             dedicated, spend-capped key for ANTHROPIC_API_KEY.
+#   verify    no model, read-only, never runs patched code: re-applies the
+#             patch on the base commit, rejects harness or workflow edits, runs
+#             the base diff-guard. Sole source of the guard verdict.
+#   verify-gates  no model, no secrets, read-only, no outputs: runs gates.sh on
+#             the patched tree (agent-written code). Its job result only sets
+#             the "[gates failing]" title prefix; CI on the PR is authoritative.
+#   publish   no model, writes: commits the patch to the claimed branch, opens
+#             a DRAFT pull request labeled agent:authored. Never merges.
+#
+# GITHUB_TOKEN and chaining. Events caused by GITHUB_TOKEN start no workflows,
+# except workflow_dispatch and repository_dispatch. Two consequences:
+#   1. agent:ready applied by the triage loop (GITHUB_TOKEN) does not start this
+#      lane. That is intended: only a maintainer's own label or dispatch does.
+#   2. The draft PR is opened with GITHUB_TOKEN, so `pull_request` CI does not
+#      run on it by itself. The publish job dispatches the workflow named in the
+#      repository variable AGENT_CI_WORKFLOW (for example ci.yml, which must
+#      accept workflow_dispatch) on the agent branch. We chose dispatch chaining
+#      over a PAT or app token because those are long-lived credentials that
+#      can trigger anything; the job token expires with the job.
+#
+# Kill switch: repository variable AGENT_ENABLED must be "true".
+# Operating guide: .harness/docs/factory.md
+
+name: agent-implement
+
+on:
+  issues:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: Issue number to implement
+        required: true
+        type: number
+
+permissions: {}
+
+concurrency:
+  group: agent-implement-${{ github.event.issue.number || inputs.issue }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    if: >-
+      vars.AGENT_ENABLED == 'true' &&
+      (github.event_name == 'workflow_dispatch' || github.event.label.name == 'agent:ready')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+      wip_full: ${{ steps.wip.outputs.full }}
+      wip_count: ${{ steps.wip.outputs.count }}
+      wip_max: ${{ steps.wip.outputs.max }}
+      issue: ${{ steps.check.outputs.issue }}
+      text_sha256: ${{ steps.check.outputs.text_sha256 }}
+      default_branch: ${{ steps.branch.outputs.name }}
+    steps:
+      - name: Kill switch (vars.AGENT_ENABLED)
+        env:
+          AGENT_ENABLED: ${{ vars.AGENT_ENABLED }}
+        run: |
+          if [ "${AGENT_ENABLED:-}" != "true" ]; then
+            echo "::error::AGENT_ENABLED is not 'true'; agent workflows are paused."
+            exit 1
+          fi
+
+      - name: Resolve default branch
+        id: branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: echo "name=$(gh api "repos/$REPO" --jq '.default_branch')" >> "$GITHUB_OUTPUT"
+
+      - name: Check out default branch (maintainers list and config)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.branch.outputs.name }}
+          persist-credentials: false
+          sparse-checkout: .harness
+
+      - name: Check sender and issue
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          SENDER: ${{ github.event_name == 'workflow_dispatch' && github.triggering_actor || github.event.sender.login }}
+          ISSUE: ${{ github.event.issue.number || inputs.issue }}
+        run: |
+          set -euo pipefail
+          echo "proceed=false" >> "$GITHUB_OUTPUT"
+          case "$ISSUE" in ''|*[!0-9]*) echo "::error::invalid issue number"; exit 1 ;; esac
+          echo "issue=$ISSUE" >> "$GITHUB_OUTPUT"
+          test -s .harness/maintainers.txt || { echo "::error::MISCONFIGURED: .harness/maintainers.txt missing or empty"; exit 1; }
+          if ! sed 's/#.*//; s/[[:space:]]//g' .harness/maintainers.txt | grep -v '^$' | grep -qixF -- "$SENDER"; then
+            echo "::notice::$SENDER is not in .harness/maintainers.txt; not starting."
+            exit 0
+          fi
+          perm="$(gh api "repos/$REPO/collaborators/$SENDER/permission" --jq '.permission' 2>/dev/null || echo none)"
+          case "$perm" in admin|write) ;; *) echo "::notice::$SENDER has '$perm' permission; not starting."; exit 0 ;; esac
+          gh api "repos/$REPO/issues/$ISSUE" > issue.json
+          if [ "$(jq -r '.pull_request != null' issue.json)" = "true" ] || [ "$(jq -r '.state' issue.json)" != "open" ]; then
+            echo "::notice::#$ISSUE is not an open issue."; exit 0
+          fi
+          # The approval covers the issue text as it was when the maintainer
+          # labeled or dispatched. Refuse if the title or body was edited after
+          # that. updated_at is not used: labels and comments also bump it.
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            approved="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          else
+            approved="$(gh api --paginate "repos/$REPO/issues/$ISSUE/events?per_page=100" \
+              --jq '.[] | select(.event == "labeled" and .label.name == "agent:ready") | .created_at' | sort | tail -n 1)"
+          fi
+          renamed="$(gh api --paginate "repos/$REPO/issues/$ISSUE/events?per_page=100" \
+            --jq '.[] | select(.event == "renamed") | .created_at' | sort | tail -n 1)"
+          body_edit="$(gh api graphql -F owner="${REPO%%/*}" -F name="${REPO#*/}" -F n="$ISSUE" \
+            -f query='query($owner:String!,$name:String!,$n:Int!){repository(owner:$owner,name:$name){issue(number:$n){lastEditedAt}}}' \
+            --jq '.data.repository.issue.lastEditedAt // ""')"
+          last_edit="$(printf '%s\n%s\n' "$renamed" "$body_edit" | sort | tail -n 1)"
+          if [ -z "$approved" ]; then
+            echo "::error::could not find when agent:ready was applied to #$ISSUE"; exit 1
+          fi
+          if [ -n "$last_edit" ] && [[ "$last_edit" > "$approved" ]]; then
+            echo "::notice::#$ISSUE was edited at $last_edit, after approval at $approved. Re-apply agent:ready or dispatch again."
+            exit 0
+          fi
+          # Implement compares its own fetch against this hash, closing the
+          # window between this check and the agent run.
+          echo "text_sha256=$(jq -r '(.title // "") + "\n" + (.body // "")' issue.json | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Work-in-progress limit
+        id: wip
+        if: steps.check.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Review capacity, not generation, is the bottleneck: unreviewed agent
+          # PRs pile up, so stop claiming new work at the limit.
+          max="$(jq -r '.max_open_agent_prs // 3' .harness/config.json 2>/dev/null || echo 3)"
+          case "$max" in ''|*[!0-9]*) max=3 ;; esac
+          count="$(gh api -X GET search/issues -f q="repo:$REPO is:pr is:open label:\"agent:authored\"" --jq '.total_count')"
+          full=false
+          [ "$count" -ge "$max" ] && full=true
+          { echo "count=$count"; echo "max=$max"; echo "full=$full"; } >> "$GITHUB_OUTPUT"
+          echo "open agent PRs: $count (limit $max)"
+
+  wip-note:
+    needs: gate
+    if: vars.AGENT_ENABLED == 'true' && needs.gate.outputs.proceed == 'true' && needs.gate.outputs.wip_full == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Kill switch (vars.AGENT_ENABLED)
+        env:
+          AGENT_ENABLED: ${{ vars.AGENT_ENABLED }}
+        run: |
+          if [ "${AGENT_ENABLED:-}" != "true" ]; then
+            echo "::error::AGENT_ENABLED is not 'true'; agent workflows are paused."
+            exit 1
+          fi
+
+      - name: Note the limit on the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE: ${{ needs.gate.outputs.issue }}
+          COUNT: ${{ needs.gate.outputs.wip_count }}
+          MAX: ${{ needs.gate.outputs.wip_max }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          printf 'Not started: %s agent pull requests are open and the limit (`max_open_agent_prs`) is %s. Review or close one, then dispatch again with `gh workflow run agent-implement.yml -f issue=%s`.\n\nAgent-Run: %s\n' \
+            "$COUNT" "$MAX" "$ISSUE" "$RUN_URL" > note.md
+          gh api "repos/$REPO/issues/$ISSUE/comments" -F body=@note.md > /dev/null
+
+  claim:
+    needs: gate
+    if: vars.AGENT_ENABLED == 'true' && needs.gate.outputs.proceed == 'true' && needs.gate.outputs.wip_full != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      issues: write
+    outputs:
+      claimed: ${{ steps.claim.outputs.claimed }}
+      base_sha: ${{ steps.claim.outputs.base_sha }}
+      branch: ${{ steps.claim.outputs.branch }}
+    steps:
+      - name: Kill switch (vars.AGENT_ENABLED)
+        env:
+          AGENT_ENABLED: ${{ vars.AGENT_ENABLED }}
+        run: |
+          if [ "${AGENT_ENABLED:-}" != "true" ]; then
+            echo "::error::AGENT_ENABLED is not 'true'; agent workflows are paused."
+            exit 1
+          fi
+
+      - name: Check out default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.gate.outputs.default_branch }}
+          persist-credentials: false
+
+      - name: Claim by pushing agent/issue-N without force
+        id: claim
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE: ${{ needs.gate.outputs.issue }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          branch="agent/issue-$ISSUE"
+          remote="https://x-access-token:${GH_TOKEN}@${GITHUB_SERVER_URL#https://}/${REPO}.git"
+          echo "claimed=false" >> "$GITHUB_OUTPUT"
+          # A branch that already exists (even at the base commit) is someone
+          # else's claim. The push below is the atomic step: two racing runs
+          # create different commits, and only the first non-forced push lands.
+          if git ls-remote --exit-code --heads "$remote" "$branch" > /dev/null 2>&1; then
+            echo "::notice::$branch exists; another run owns #$ISSUE. Delete the branch to retry."
+            exit 0
+          fi
+          base="$(git rev-parse HEAD)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -q -m "agent: claim #$ISSUE" -m "Agent-Claim: run $RUN_ID"
+          if ! git push "$remote" "HEAD:refs/heads/$branch"; then
+            echo "::notice::push rejected; another run claimed #$ISSUE first."
+            exit 0
+          fi
+          { echo "claimed=true"; echo "base_sha=$base"; echo "branch=$branch"; } >> "$GITHUB_OUTPUT"
+          gh api -X DELETE "repos/$REPO/issues/$ISSUE/labels/agent:ready" > /dev/null 2>&1 || true
+          gh api "repos/$REPO/issues/$ISSUE/labels" -f "labels[]=agent:in-progress" > /dev/null
+
+  implement:
+    needs: [gate, claim]
+    if: vars.AGENT_ENABLED == 'true' && needs.claim.outputs.claimed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      issues: read
+      # id-token: write   # only when authenticating the model with OIDC / workload identity federation
+    env:
+      ISSUE: ${{ needs.gate.outputs.issue }}
+      BASE_SHA: ${{ needs.claim.outputs.base_sha }}
+    steps:
+      - name: Kill switch (vars.AGENT_ENABLED)
+        env:
+          AGENT_ENABLED: ${{ vars.AGENT_ENABLED }}
+        run: |
+          if [ "${AGENT_ENABLED:-}" != "true" ]; then
+            echo "::error::AGENT_ENABLED is not 'true'; agent workflows are paused."
+            exit 1
+          fi
+
+      - name: Check out base commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.claim.outputs.base_sha }}
+          persist-credentials: false
+
+      # ===== TOOLCHAIN SETUP (fill in for this repository) =================
+      # The agent's shell allowlist cannot install anything, so gates.sh only
+      # works if dependencies are installed here, before the agent step. This
+      # runs on the base commit (trusted, reviewed code), not on agent output.
+      # Keep these steps free of the model credential: no secrets in env/with.
+      # Add language setup steps here (each `uses:` pinned to a full SHA), e.g.
+      # actions/setup-node, actions/setup-python, actions/setup-go.
+      - name: Install dependencies (commands.setup from the base config)
+        run: |
+          set -euo pipefail
+          # Read at run time from the base commit's .harness/config.json; this
+          # workflow is copied verbatim at install time, so nothing is substituted.
+          cmd="$(jq -r '.commands.setup // ""' .harness/config.json 2>/dev/null || true)"
+          if [ -z "$cmd" ]; then
+            echo "::notice::commands.setup is empty in .harness/config.json; no dependency install."
+          else
+            echo "setup: $cmd"
+            bash -c "$cmd"
+          fi
+          # Whatever setup created (node_modules, .venv, caches) must not end up
+          # in the agent's patch, even when the repository does not ignore it.
+          # Anchored with a leading / so only those exact top-level paths match.
+          git ls-files --others --exclude-standard --directory | sed 's|^|/|' >> .git/info/exclude
+      # ===== END TOOLCHAIN SETUP ===========================================
+
+      - name: Package the issue as data and build the prompt
+        id: prompt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TEXT_SHA256: ${{ needs.gate.outputs.text_sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p agent-input agent-out
+          printf 'agent-input/\nagent-out/\nimplement-out/\n' >> .git/info/exclude
+          gh api "repos/$REPO/issues/$ISSUE" > "$RUNNER_TEMP/issue.json"
+          now="$(jq -r '(.title // "") + "\n" + (.body // "")' "$RUNNER_TEMP/issue.json" | sha256sum | cut -d' ' -f1)"
+          if [ "$now" != "$TEXT_SHA256" ]; then
+            echo "::error::the issue text changed after the gate approved it; re-apply agent:ready or dispatch again"
+            exit 1
+          fi
+          jq -r '"# " + (.title // "") + "\n\n" + (.body // "(empty body)")' "$RUNNER_TEMP/issue.json" \
+            | python3 .harness/bin/strip-hidden.py --max-chars 20000 > agent-input/issue.md
+          attempts="$(jq -r '.max_fix_attempts // 2' .harness/config.json 2>/dev/null || echo 2)"
+          delim="EOF_$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+          {
+            echo "text<<$delim"
+            cat .harness/prompts/implement.md
+            printf '\nRepository: %s\nIssue: #%s (text in agent-input/issue.md)\nmax_fix_attempts: %s\n' "$REPO" "$ISSUE" "$attempts"
+            echo "$delim"
+            echo "schema=$(jq -c . .harness/schemas/implement.schema.json)"
+          } >> "$GITHUB_OUTPUT"
+
+      # ===== AGENT STEP (adapter: claude) ==================================
+      # The only vendor-specific step. Contract for a replacement step:
+      #   - id: agent; edits the working tree only; shell limited to the
+      #     harness gate scripts and read-only git; no network fetch tools
+      #   - prompt: steps.prompt.outputs.text; result JSON must match
+      #     .harness/schemas/implement.schema.json
+      #   - deliver the JSON as output `structured_output` or write it to
+      #     agent-out/result.json; optional agent-out/cost.txt (USD, one number)
+      # Credentials (claude adapter): secret ANTHROPIC_API_KEY. Alternatives:
+      # claude_code_oauth_token with secret CLAUDE_CODE_OAUTH_TOKEN, or OIDC via
+      # anthropic_federation_rule_id + anthropic_organization_id (needs id-token: write).
+      - name: Run agent (claude-code-action)
+        id: agent
+        uses: anthropics/claude-code-action@4fa93a88de49bbef68b10eb15aabedf28ca0e1ed # v1.0.271
+        env:
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Read-only job token: the agent cannot push, comment or open PRs.
+          github_token: ${{ github.token }}
+          prompt: ${{ steps.prompt.outputs.text }}
+          # The Claude process holds the model credential. The Read deny rules
+          # (which Claude Code also applies to Grep, Glob, Edit and Write; a
+          # Grep(path) or Glob(path) rule would be accepted but never match)
+          # keep the agent's file tools out of /proc (process environment), the
+          # runner temp dir and ~/.claude. `//` marks an absolute path.
+          # git diff is allowed in fixed forms only: `git diff *` would allow
+          # --no-index (read any file) and --output=<path> (write any file).
+          # Edit(/.git/**) also covers Write; Write(path) rules never match.
+          # gates.sh runs agent-written tests in this job, beside the Claude
+          # process that holds the model key. CLAUDE_CODE_SUBPROCESS_ENV_SCRUB
+          # is the only barrier between that code and the key, so use a
+          # dedicated, spend-capped key for this secret.
+          claude_args: >-
+            --max-turns 80
+            --allowedTools "Read,Grep,Glob,Edit,Write,Bash(.harness/bin/gates.sh),Bash(.harness/bin/gates.sh *),Bash(.harness/bin/diff-guard.sh),Bash(.harness/bin/diff-guard.sh *),Bash(git status),Bash(git diff),Bash(git diff --stat),Bash(git diff --cached)"
+            --disallowedTools "WebFetch,WebSearch,Edit(/.harness/**),Edit(/.github/**),Edit(/.git/**),Write(/.harness/**),Write(/.github/**),Read(//proc/**),Read(/${{ runner.temp }}/**),Read(~/.claude/**)"
+            --json-schema '${{ steps.prompt.outputs.schema }}'
+      - name: Record agent cost (claude adapter, best effort)
+        if: always() && steps.agent.outputs.execution_file != ''
+        env:
+          EXECUTION_FILE: ${{ steps.agent.outputs.execution_file }}
+        run: |
+          python3 - "$EXECUTION_FILE" > agent-out/cost.txt <<'PY' || rm -f agent-out/cost.txt
+          import json, sys
+          data = json.load(open(sys.argv[1]))
+          items = data if isinstance(data, list) else [data]
+          costs = [m.get("total_cost_usd") for m in items if isinstance(m, dict) and m.get("type") == "result"]
+          costs = [c for c in costs if isinstance(c, (int, float))]
+          if not costs:
+              sys.exit(1)
+          print("%.4f" % costs[-1])
+          PY
+      # ===== END AGENT STEP ================================================
+
+      - name: Collect agent output and patch
+        if: always()
+        env:
+          RESULT: ${{ steps.agent.outputs.structured_output }}
+        run: |
+          set -euo pipefail
+          mkdir -p implement-out
+          # Keep the step's own output out of the patch even if the prompt
+          # step did not run.
+          grep -qxF 'implement-out/' .git/info/exclude 2>/dev/null || printf 'implement-out/\n' >> .git/info/exclude
+          if [ -n "${RESULT:-}" ]; then
+            printf '%s' "$RESULT" > implement-out/result.json
+          elif [ -f agent-out/result.json ] && [ ! -L agent-out/result.json ]; then
+            cp agent-out/result.json implement-out/result.json
+          else
+            printf '{"summary":"","attempts":0,"blocked":true,"blocker":"The agent produced no structured result (turn cap, timeout or error)."}' > implement-out/result.json
+          fi
+          if [ -f agent-out/cost.txt ] && [ ! -L agent-out/cost.txt ]; then
+            grep -E '^[0-9]+(\.[0-9]+)?$' agent-out/cost.txt > implement-out/cost.txt || true
+          fi
+          git add -A
+          git diff --cached --binary "$BASE_SHA" > implement-out/agent.patch
+          wc -c implement-out/agent.patch
+
+      - name: Upload patch and result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: agent-implement-${{ needs.gate.outputs.issue }}
+          path: implement-out/
+          if-no-files-found: error
+          retention-days: 14
+
+  verify:
+    needs: [gate, claim, implement]
+    if: always() && vars.AGENT_ENABLED == 'true' && needs.claim.outputs.claimed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    # This job never executes code from the patch: it applies it, checks the
+    # paths and runs the trusted base diff-guard.sh, which only reads the diff.
+    # It is the only source of `guard` and `reason`. Gates run on the patched
+    # tree in verify-gates, which has no outputs, so agent-written code there
+    # cannot write a verdict that publish reads.
+    outputs:
+      guard: ${{ steps.check.outputs.guard }}
+      reason: ${{ steps.check.outputs.reason }}
+      patch_sha256: ${{ steps.check.outputs.patch_sha256 }}
+    env:
+      BASE_SHA: ${{ needs.claim.outputs.base_sha }}
+    steps:
+      - name: Kill switch (vars.AGENT_ENABLED)
+        env:
+          AGENT_ENABLED: ${{ vars.AGENT_ENABLED }}
+        run: |
+          if [ "${AGENT_ENABLED:-}" != "true" ]; then
+            echo "::error::AGENT_ENABLED is not 'true'; agent workflows are paused."
+            exit 1
+          fi
+
+      - name: Check out base commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.claim.outputs.base_sha }}
+          persist-credentials: false
+
+      - name: Download patch
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: agent-implement-${{ needs.gate.outputs.issue }}
+          # Outside the workspace: the files must not collide with the patch.
+          path: ${{ runner.temp }}/implement-out
+
+      - name: Re-check the patch from the trusted base
+        id: check
+        run: |
+          set -uo pipefail
+          # One printable line per value, so no path or log text can add a
+          # second key to $GITHUB_OUTPUT.
+          out() { printf '%s=%s\n' "$1" "$(printf '%s' "$2" | tr -c '[:print:]' '?' | cut -c1-300)" >> "$GITHUB_OUTPUT"; }
+          patch="$RUNNER_TEMP/implement-out/agent.patch"
+          if [ ! -s "$patch" ]; then
+            out guard fail; out reason "the agent made no changes (or the issue text changed after approval; see the implement job log)"; exit 0
+          fi
+          # Later jobs re-download the artifact; they apply only this exact patch.
+          out patch_sha256 "$(sha256sum "$patch" | cut -d' ' -f1)"
+          if ! git apply --index "$patch"; then
+            out guard fail; out reason "patch does not apply to the base commit"; exit 0
+          fi
+          # The agent must never change the harness, workflows or agent config.
+          # Paths come from the index, NUL-separated and unquoted; --no-renames
+          # lists a rename as delete plus add, so both sides are checked.
+          bad=""
+          # Matched lower-cased (case-insensitive file systems, review tools);
+          # agent config directories and files are refused at any depth.
+          while IFS= read -r -d '' p; do
+            lp="$(printf '%s' "$p" | tr '[:upper:]' '[:lower:]')"
+            case "$lp" in
+              .harness/*|.github/*|\
+              .claude/*|*/.claude/*|.codex/*|*/.codex/*|.cursor/*|*/.cursor/*|\
+              .gemini/*|*/.gemini/*|.agents/*|*/.agents/*|.mcp.json|*/.mcp.json|\
+              claude.md|*/claude.md|claude.local.md|*/claude.local.md|\
+              agents.md|*/agents.md|gemini.md|*/gemini.md)
+                bad="$bad $p" ;;
+            esac
+          done < <(git diff --cached --name-only -z --no-renames "$BASE_SHA")
+          if [ -n "$bad" ]; then
+            out guard fail; out reason "patch touches harness or agent config:$bad"; exit 0
+          fi
+          git -c user.name=verify -c user.email=verify@localhost commit -q -m "agent patch (verify)"
+          # diff-guard.sh is the base copy (.harness/ is unchanged, checked above)
+          # and reads the diff only; nothing from the patch runs in this job.
+          if .harness/bin/diff-guard.sh --base "$BASE_SHA" > guard.log 2>&1; then
+            out guard pass
+          else
+            out guard fail; out reason "diff-guard: $(tail -n 1 guard.log | tr -d '\r' | cut -c1-200)"
+          fi
+          tail -n 40 guard.log
+
+  verify-gates:
+    # Runs the gates on the patched tree. That executes agent-written code
+    # (tests, build scripts), so this job holds no secrets, a read-only token
+    # and no outputs. Publish reads only its result, as a hint in the PR title;
+    # CI on the pull request is the authoritative check.
+    needs: [gate, claim, verify]
+    if: >-
+      always() && vars.AGENT_ENABLED == 'true' &&
+      needs.verify.result == 'success' && needs.verify.outputs.guard == 'pass'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Kill switch (vars.AGENT_ENABLED)
+        env:
+          AGENT_ENABLED: ${{ vars.AGENT_ENABLED }}
+        run: |
+          if [ "${AGENT_ENABLED:-}" != "true" ]; then
+            echo "::error::AGENT_ENABLED is not 'true'; agent workflows are paused."
+            exit 1
+          fi
+
+      - name: Check out base commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.claim.outputs.base_sha }}
+          persist-credentials: false
+
+      - name: Download patch
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: agent-implement-${{ needs.gate.outputs.issue }}
+          path: ${{ runner.temp }}/implement-out
+
+      - name: Read the setup command from the base config, then apply the patch
+        env:
+          PATCH_SHA256: ${{ needs.verify.outputs.patch_sha256 }}
+        run: |
+          set -euo pipefail
+          # Captured before git apply, so the command comes from the base
+          # commit's .harness/config.json, never from the patched tree.
+          jq -r '.commands.setup // ""' .harness/config.json > "$RUNNER_TEMP/setup-cmd" 2>/dev/null || : > "$RUNNER_TEMP/setup-cmd"
+          patch="$RUNNER_TEMP/implement-out/agent.patch"
+          got="$(sha256sum "$patch" | cut -d' ' -f1)"
+          if [ -z "$PATCH_SHA256" ] || [ "$got" != "$PATCH_SHA256" ]; then
+            echo "::error::agent.patch differs from the patch the verify job checked"; exit 1
+          fi
+          git apply --index "$patch"
+
+      # ===== TOOLCHAIN SETUP (fill in for this repository; same as implement) =
+      # Runs AFTER git apply, so it installs from manifests and lockfiles the
+      # agent may have changed (install scripts are agent-controlled code).
+      # That is acceptable only because this job has a read-only token, no
+      # secrets and no outputs. Never add a secret to these steps.
+      # Add language setup steps here (each `uses:` pinned to a full SHA), e.g.
+      # actions/setup-node, actions/setup-python, actions/setup-go.
+      - name: Install dependencies (commands.setup captured from the base config)
+        run: |
+          set -euo pipefail
+          cmd="$(cat "$RUNNER_TEMP/setup-cmd")"
+          if [ -z "$cmd" ]; then
+            echo "::notice::commands.setup is empty in .harness/config.json; no dependency install."
+          else
+            echo "setup: $cmd"
+            bash -c "$cmd"
+          fi
+      # ===== END TOOLCHAIN SETUP ===========================================
+
+      - name: Run gates on the patched tree (agent-written code runs here)
+        run: |
+          set -uo pipefail
+          .harness/bin/gates.sh > "$RUNNER_TEMP/gates.log" 2>&1 || true
+          tail -n 60 "$RUNNER_TEMP/gates.log"
+          line="$(grep -E '^HARNESS_GATES: (PASS|FAIL|MISCONFIGURED)' "$RUNNER_TEMP/gates.log" | tail -n 1 || true)"
+          echo "verdict: ${line:-HARNESS_GATES: MISCONFIGURED (no verdict line)}"
+          case "$line" in "HARNESS_GATES: PASS"*) exit 0 ;; *) exit 1 ;; esac
+
+  publish:
+    needs: [gate, claim, implement, verify, verify-gates]
+    if: always() && vars.AGENT_ENABLED == 'true' && needs.claim.outputs.claimed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
+    env:
+      ISSUE: ${{ needs.gate.outputs.issue }}
+      BRANCH: ${{ needs.claim.outputs.branch }}
+      DEFAULT_BRANCH: ${{ needs.gate.outputs.default_branch }}
+      GUARD: ${{ needs.verify.outputs.guard }}
+      REASON: ${{ needs.verify.outputs.reason }}
+      # success, failure, cancelled or skipped; only success drops the prefix.
+      GATES_RESULT: ${{ needs.verify-gates.result }}
+      PATCH_SHA256: ${{ needs.verify.outputs.patch_sha256 }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Kill switch (vars.AGENT_ENABLED)
+        id: killswitch
+        env:
+          AGENT_ENABLED: ${{ vars.AGENT_ENABLED }}
+        run: |
+          if [ "${AGENT_ENABLED:-}" != "true" ]; then
+            echo "::error::AGENT_ENABLED is not 'true'; agent workflows are paused."
+            exit 1
+          fi
+
+      - name: Check out the claimed branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.claim.outputs.branch }}
+          persist-credentials: false
+
+      # Only a passing verify guarantees the artifact exists. When implement was
+      # cancelled or its upload failed, verify fails or is skipped, guard is
+      # empty, and the park step below still runs.
+      - name: Download patch
+        id: download
+        if: needs.verify.outputs.guard == 'pass'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: agent-implement-${{ needs.gate.outputs.issue }}
+          path: ${{ runner.temp }}/implement-out
+
+      - name: Park the issue when verification refused the patch or did not finish
+        # Runs on every non-pass verdict (verify failed, skipped or cancelled,
+        # so guard is empty) and when the download itself failed. Not after a
+        # failed kill switch, and not when the run was cancelled.
+        if: >-
+          ${{ !cancelled() && steps.killswitch.outcome == 'success' &&
+          (needs.verify.outputs.guard != 'pass' || steps.download.outcome == 'failure') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          IMPLEMENT_RESULT: ${{ needs.implement.result }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+        run: |
+          set -euo pipefail
+          if [ "$DOWNLOAD_OUTCOME" = "failure" ]; then
+            why="the verified patch artifact could not be downloaded"
+          elif [ -n "${REASON:-}" ]; then
+            why="$REASON"
+          else
+            why="verification did not complete (implement: ${IMPLEMENT_RESULT:-unknown}, verify: ${VERIFY_RESULT:-unknown})"
+          fi
+          printf 'The agent run did not produce a pull request.\n\nReason: %s\n\nThe branch `%s` stays as the claim. Delete it to allow a new run.\n\nAgent-Run: %s\n' \
+            "$why" "$BRANCH" "$RUN_URL" > note.md
+          gh api "repos/$REPO/issues/$ISSUE/comments" -F body=@note.md > /dev/null
+          gh api -X DELETE "repos/$REPO/issues/$ISSUE/labels/agent:in-progress" > /dev/null 2>&1 || true
+          gh api "repos/$REPO/issues/$ISSUE/labels" -f "labels[]=agent:parked" > /dev/null
+
+      - name: Commit, push without force, open a draft pull request
+        if: needs.verify.outputs.guard == 'pass'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CI_WORKFLOW: ${{ vars.AGENT_CI_WORKFLOW }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/implement-out"
+          python3 .harness/bin/agent-output.py implement --input "$out/result.json" --out "$RUNNER_TEMP/summary.md" \
+            || printf 'The agent summary failed validation and is not shown.\n' > "$RUNNER_TEMP/summary.md"
+          title="$(gh api "repos/$REPO/issues/$ISSUE" --jq '.title' | python3 .harness/bin/strip-hidden.py --max-chars 90 | tr -s '\n\r\t' ' ')"
+          case "$GATES_RESULT" in success) prefix="" ;; *) prefix="[gates failing] " ;; esac
+          cost=""
+          [ -s "$out/cost.txt" ] && cost="$(head -n 1 "$out/cost.txt")"
+          # Apply only the exact patch the verify job checked.
+          got="$(sha256sum "$out/agent.patch" | cut -d' ' -f1)"
+          if [ -z "${PATCH_SHA256:-}" ] || [ "$got" != "$PATCH_SHA256" ]; then
+            echo "::error::agent.patch differs from the patch the verify job checked; not publishing"; exit 1
+          fi
+          git apply --index "$out/agent.patch"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -q -m "agent: #$ISSUE ${title}" -m "Closes #$ISSUE" -m "Agent-Run: $RUN_URL"
+          remote="https://x-access-token:${GH_TOKEN}@${GITHUB_SERVER_URL#https://}/${REPO}.git"
+          git push "$remote" "HEAD:refs/heads/$BRANCH"
+          {
+            printf 'Closes #%s\n\nDraft opened by the implement lane. A human reviews and merges; the agent never does.\n\n' "$ISSUE"
+            printf '### Checks before this PR was opened\n\n'
+            printf -- '- Path filter and diff-guard (verify job, base scripts, patch not executed): pass\n'
+            printf -- '- Gates (verify-gates job): %s. That job ran agent-written code, so its result is a hint, not a trusted verdict. CI on this pull request is authoritative.\n\n' "$GATES_RESULT"
+            cat "$RUNNER_TEMP/summary.md"
+            printf '\n---\nAgent-Run: %s\n' "$RUN_URL"
+            [ -n "$cost" ] && printf 'Agent-Cost-USD: %s\n' "$cost"
+            true
+          } > body.md
+          gh pr create --draft --base "$DEFAULT_BRANCH" --head "$BRANCH" \
+            --title "${prefix}agent: #$ISSUE ${title}" --body-file body.md --label agent:authored
+          if [ -n "${CI_WORKFLOW:-}" ]; then
+            gh workflow run "$CI_WORKFLOW" --ref "$BRANCH" || echo "::warning::could not dispatch $CI_WORKFLOW on $BRANCH"
+          else
+            echo "::notice::AGENT_CI_WORKFLOW is not set; CI will not run on $BRANCH until a human pushes or dispatches it."
+          fi

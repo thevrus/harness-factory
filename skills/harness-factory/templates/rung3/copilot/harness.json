@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {"type": "command", "bash": ".harness/hooks/protect-paths.sh --agent copilot", "cwd": ".", "timeoutSec": 30,
+       "matcher": "create|edit|str_replace_editor|apply_patch"},
+      {"type": "command", "bash": ".harness/hooks/guard-bash.sh --agent copilot", "cwd": ".", "timeoutSec": 30,
+       "matcher": "bash|powershell"}
+    ]
+  }
+}

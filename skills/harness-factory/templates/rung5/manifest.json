@@ -1,0 +1,27 @@
+{
+  "rung": 5,
+  "name": "Factory",
+  "_comment": [
+    "For the orchestrator: optional config keys read at run time from .harness/config.json on the default branch (no install-time substitution):",
+    "  max_open_agent_prs (integer, default 3): work-in-progress limit; agent-implement.yml will not claim a new issue while this many agent:authored PRs are open.",
+    "  max_fix_attempts (integer, default 2): stall rule in .harness/prompts/implement.md.",
+    "Repository variable AGENT_CI_WORKFLOW (human sets it): CI workflow file name dispatched on the agent branch, because PRs opened with GITHUB_TOKEN start no workflows.",
+    "Workflow entries carry \"agent\": \"claude\" (adapter; only the marked AGENT STEP is vendor-specific).",
+    "Depends on rung 4 files: .harness/bin/agent-output.py, strip-hidden.py, maintainers.txt, triage-labels.txt."
+  ],
+  "requires_config": [],
+  "files": [
+    {"src": ".github/workflows/agent-implement.yml", "dest": ".github/workflows/agent-implement.yml", "strategy": "create", "agent": "claude"},
+    {"src": ".github/workflows/agent-monitor.yml", "dest": ".github/workflows/agent-monitor.yml", "strategy": "create"},
+    {"src": ".harness/prompts/implement.md", "dest": ".harness/prompts/implement.md", "strategy": "create"},
+    {"src": ".harness/schemas/implement.schema.json", "dest": ".harness/schemas/implement.schema.json", "strategy": "create"},
+    {"src": ".harness/schemas/incident.schema.json", "dest": ".harness/schemas/incident.schema.json", "strategy": "create"},
+    {"src": ".harness/bin/metrics.py", "dest": ".harness/bin/metrics.py", "mode": "0755", "strategy": "create"},
+    {"src": ".harness/bin/mine-corrections.py", "dest": ".harness/bin/mine-corrections.py", "mode": "0755", "strategy": "create"},
+    {"src": ".harness/bin/new-failure-case.sh", "dest": ".harness/bin/new-failure-case.sh", "mode": "0755", "strategy": "create"},
+    {"src": ".harness/failures/README.md", "dest": ".harness/failures/README.md", "strategy": "create"},
+    {"src": ".harness/failure-signatures.yml", "dest": ".harness/failure-signatures.yml", "strategy": "create"},
+    {"src": ".harness/rules-inbox.md", "dest": ".harness/rules-inbox.md", "strategy": "create"},
+    {"src": ".harness/docs/factory.md", "dest": ".harness/docs/factory.md", "strategy": "create"}
+  ]
+}

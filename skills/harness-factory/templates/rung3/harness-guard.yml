@@ -1,0 +1,113 @@
+# harness-guard: required checks for every pull request.
+#
+# SECURITY: this is a `pull_request` workflow and the gates job runs scripts
+# the pull request controls (tests, build). It must hold NO secrets and NO
+# write permission: keep every `permissions:` block read-only, never add
+# `secrets.*`, and never switch the trigger to `pull_request_target`.
+#
+# The guard job never runs pull request code. It loads diff-guard and the
+# workflow linter from the base branch, so a pull request cannot weaken the
+# checks that judge it (on the bootstrap PR, before the base has them, it falls
+# back to the PR's copy and says so). The gates job runs on a separate runner.
+#
+# Re-runs on review events so a CODEOWNER approval of the current head can
+# unlock protected-path changes; see .harness/docs/branch-protection.md.
+name: harness-guard
+
+on:
+  pull_request:
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: harness-guard-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    name: harness-guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Load guard scripts from the base branch
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          dest="$RUNNER_TEMP/harness"
+          mkdir -p "$dest"
+          for f in diff-guard.sh harness_guard.py lint-agent-workflows.py; do
+            if git cat-file -e "origin/${BASE_REF}:.harness/bin/${f}" 2>/dev/null; then
+              git show "origin/${BASE_REF}:.harness/bin/${f}" > "$dest/${f}"
+            else
+              echo "::warning::.harness/bin/${f} is not on ${BASE_REF} yet; using this pull request's copy (bootstrap)"
+              cp ".harness/bin/${f}" "$dest/${f}"
+            fi
+          done
+          chmod +x "$dest"/*
+
+      - name: Check for a CODEOWNER approval of the current head
+        id: approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/reviews" \
+            --jq '.[] | [.user.login, .state, .commit_id] | @tsv' > "$RUNNER_TEMP/reviews.tsv"
+          : > "$RUNNER_TEMP/CODEOWNERS"
+          for f in .github/CODEOWNERS CODEOWNERS docs/CODEOWNERS; do
+            if git cat-file -e "origin/${BASE_REF}:${f}" 2>/dev/null; then
+              git show "origin/${BASE_REF}:${f}" > "$RUNNER_TEMP/CODEOWNERS"
+              break
+            fi
+          done
+          approved="$(python3 "$RUNNER_TEMP/harness/harness_guard.py" codeowner-approval \
+            --reviews "$RUNNER_TEMP/reviews.tsv" --codeowners "$RUNNER_TEMP/CODEOWNERS" \
+            --head-sha "$HEAD_SHA" --author "$PR_AUTHOR")"
+          echo "approved=${approved}" >> "$GITHUB_OUTPUT"
+
+      - name: Diff guard
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HARNESS_PROTECTED_APPROVED: ${{ steps.approval.outputs.approved }}
+        run: bash "$RUNNER_TEMP/harness/diff-guard.sh" --base "origin/${BASE_REF}" --allow-protected
+
+      - name: Workflow lint
+        run: python3 "$RUNNER_TEMP/harness/lint-agent-workflows.py" --root .
+
+  gates:
+    name: harness-gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Add toolchain setup steps here (each `uses:` pinned to a full SHA).
+
+      - name: Run gates
+        run: |
+          if [ ! -x .harness/bin/gates.sh ]; then
+            echo "::error::.harness/bin/gates.sh is missing or not executable"
+            exit 1
+          fi
+          .harness/bin/gates.sh

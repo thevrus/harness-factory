@@ -1,0 +1,70 @@
+# Protected paths: changes here need a human (CODEOWNER) approval.
+#
+# Syntax is gitignore-style, one pattern per line:
+#   name        matches a file or directory with that name at any depth
+#   dir/        matches a directory (and everything inside it) at any depth
+#   a/b/**      matches everything under a/b (anchored at the repo root)
+#   /file       anchored at the repo root
+#   !pattern    re-includes a path an earlier line matched
+# Matching is case-insensitive on purpose: on a case-insensitive filesystem
+# ".GitHub/workflows" is the same directory as ".github/workflows".
+#
+# Who reads this file:
+#   .harness/hooks/protect-paths.sh   makes the agent's file-edit tools ask a
+#                                     human first (.harness/acceptance/ is
+#                                     always blocked)
+#   .harness/bin/diff-guard.sh        fails CI when a diff touches a match
+# Both also apply a built-in copy of the defaults below, so deleting a default
+# from this file does not unprotect it.
+#
+# ADD REPO-SPECIFIC ENTRIES at the bottom: database migrations, auth and
+# session code, billing and payments, infrastructure (terraform, k8s, deploy
+# scripts), secrets and environment config. Entries from `protected_paths` and
+# `human_only_areas` in .harness/config.json land in the block between the
+# "harness:config" marker lines, written by `hf_install.py sync`; do not edit
+# inside that block.
+
+# Harness and agent configuration: an agent must not edit the rules it runs under.
+.harness/**
+.harness/acceptance/**
+.github/workflows/**
+.claude/**
+.codex/**
+.cursor/**
+.gemini/**
+.agents/**
+.github/hooks/**
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+.mcp.json
+
+# Ownership
+CODEOWNERS
+.github/CODEOWNERS
+docs/CODEOWNERS
+
+# Lockfiles: dependency changes are a supply-chain decision.
+package-lock.json
+npm-shrinkwrap.json
+yarn.lock
+pnpm-lock.yaml
+bun.lock
+bun.lockb
+Cargo.lock
+Gemfile.lock
+poetry.lock
+uv.lock
+Pipfile.lock
+pdm.lock
+composer.lock
+go.sum
+mix.lock
+pubspec.lock
+Podfile.lock
+packages.lock.json
+flake.lock
+gradle.lockfile
+.terraform.lock.hcl
+
+# Repo-specific entries (migrations, auth, billing, infra) go below this line.

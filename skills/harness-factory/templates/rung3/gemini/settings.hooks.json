@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "BeforeTool": [
+      {
+        "matcher": "write_file|replace",
+        "hooks": [
+          {
+            "type": "command",
+            "name": "harness-protect-paths",
+            "command": "\"$GEMINI_PROJECT_DIR/.harness/hooks/protect-paths.sh\" --agent gemini",
+            "timeout": 30000
+          }
+        ]
+      },
+      {
+        "matcher": "run_shell_command",
+        "hooks": [
+          {
+            "type": "command",
+            "name": "harness-guard-bash",
+            "command": "\"$GEMINI_PROJECT_DIR/.harness/hooks/guard-bash.sh\" --agent gemini",
+            "timeout": 30000
+          }
+        ]
+      }
+    ]
+  }
+}

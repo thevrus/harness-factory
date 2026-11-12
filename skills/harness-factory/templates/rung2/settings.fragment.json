@@ -1,0 +1,29 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.harness/hooks/mark-dirty.sh",
+            "args": ["--agent", "claude"],
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.harness/hooks/require-evidence.sh",
+            "args": ["--agent", "claude"],
+            "timeout": 120
+          }
+        ]
+      }
+    ]
+  }
+}

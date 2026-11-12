@@ -1,0 +1,35 @@
+# Failure signature taxonomy. Shared ids for .harness/failures/*/signature,
+# repeat-failure rate (metrics.py) and the rules inbox (mine-corrections.py).
+# Constrained format so stdlib scripts can parse it: one "- id:" line per entry
+# at column 0, then indented "title:" and "keywords: [a, b]" lines. Keywords
+# are lowercase substrings matched against maintainer review text.
+- id: untested-claim
+  title: Claimed a check passed without running it, or without quoting the verdict line
+  keywords: [didn't run, did not run, not run, no evidence, claimed it passes, untested]
+- id: edited-test-not-code
+  title: Changed or weakened a test (or skipped it) instead of fixing the code
+  keywords: [edited the test, weakened the test, skip the test, xfail, changed the assertion, test was modified]
+- id: protected-path-touched
+  title: Touched a protected or human-only path
+  keywords: [protected path, human-only, should not touch, ci config, workflow file]
+- id: wrong-date-semantics
+  title: Wrong date or time semantics (time zone, inclusive range, local versus UTC)
+  keywords: [timezone, time zone, utc, off by one day, inclusive, date range]
+- id: scope-creep
+  title: Drive-by changes unrelated to the task
+  keywords: [unrelated, drive-by, out of scope, not asked, scope creep]
+- id: misread-spec
+  title: Built something other than what the issue asked
+  keywords: [not what the issue, misread, wrong requirement, spec says]
+- id: missing-error-handling
+  title: Failure swallowed or not surfaced
+  keywords: [swallow, silently, error handling, ignores the error, bare except]
+- id: api-hallucination
+  title: Used a function, flag or API that does not exist in the version in use
+  keywords: [does not exist, no such, hallucinat, wrong api, deprecated]
+- id: dependency-change
+  title: Added or bumped a dependency without being asked
+  keywords: [new dependency, added a dependency, lockfile, bumped]
+- id: oversized-diff
+  title: Diff larger than the task needs or than max_diff_lines
+  keywords: [too big, too large, split this, oversized]

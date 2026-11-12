@@ -1,0 +1,5 @@
+# GitHub logins allowed to start agent work (one per line, '#' starts a comment).
+# Only labels applied by, and workflow dispatches started by, these logins can
+# start the implement lane, and only their review comments feed the rules inbox.
+# Workflows read this file from the default branch, never from the event or a
+# pull request. Change it through a reviewed pull request.

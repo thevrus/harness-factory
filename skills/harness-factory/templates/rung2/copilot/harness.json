@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "hooks": {
+    "postToolUse": [
+      {"type": "command", "bash": ".harness/hooks/mark-dirty.sh --agent copilot", "cwd": ".", "timeoutSec": 10,
+       "matcher": "create|edit|str_replace_editor|apply_patch"}
+    ],
+    "agentStop": [
+      {"type": "command", "bash": ".harness/hooks/require-evidence.sh --agent copilot", "cwd": ".", "timeoutSec": 120}
+    ]
+  }
+}

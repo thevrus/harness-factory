@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["labels", "comment", "reason"],
+  "properties": {
+    "labels": {"type": "array", "maxItems": 5, "items": {"type": "string", "maxLength": 50}},
+    "comment": {"type": "string", "maxLength": 3000},
+    "reason": {"type": "string", "maxLength": 500}
+  }
+}

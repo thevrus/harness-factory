@@ -1,0 +1,142 @@
+{
+  "rung": 2,
+  "name": "Verifiable",
+  "requires_config": [
+    "commands.test"
+  ],
+  "files": [
+    {
+      "src": "_lib.sh",
+      "dest": ".harness/bin/_lib.sh",
+      "mode": "0644",
+      "strategy": "create"
+    },
+    {
+      "src": "gates.sh",
+      "dest": ".harness/bin/gates.sh",
+      "mode": "0755",
+      "strategy": "create"
+    },
+    {
+      "src": "gates.conf",
+      "dest": ".harness/gates.conf",
+      "strategy": "create"
+    },
+    {
+      "src": "smoke.sh",
+      "dest": ".harness/bin/smoke.sh",
+      "mode": "0755",
+      "strategy": "create",
+      "when": "core_flow.smoke_command"
+    },
+    {
+      "src": "smoke.stub.sh",
+      "dest": ".harness/bin/smoke.sh",
+      "mode": "0755",
+      "strategy": "create",
+      "unless": "core_flow.smoke_command"
+    },
+    {
+      "src": "prove-test.sh",
+      "dest": ".harness/bin/prove-test.sh",
+      "mode": "0755",
+      "strategy": "create"
+    },
+    {
+      "src": "mark-dirty.sh",
+      "dest": ".harness/hooks/mark-dirty.sh",
+      "mode": "0755",
+      "strategy": "create"
+    },
+    {
+      "src": "require-evidence.sh",
+      "dest": ".harness/hooks/require-evidence.sh",
+      "mode": "0755",
+      "strategy": "create"
+    },
+    {
+      "src": "evidence.md",
+      "dest": ".harness/docs/evidence.md",
+      "strategy": "create"
+    },
+    {
+      "src": "pr-template.evidence.md",
+      "dest": ".github/pull_request_template.md",
+      "strategy": "md-section",
+      "marker": "evidence",
+      "dest_any": [
+        ".github/PULL_REQUEST_TEMPLATE.md",
+        "PULL_REQUEST_TEMPLATE.md",
+        "pull_request_template.md",
+        "docs/pull_request_template.md",
+        "docs/PULL_REQUEST_TEMPLATE.md"
+      ]
+    },
+    {
+      "src": "settings.fragment.json",
+      "dest": ".claude/settings.json",
+      "strategy": "json-merge",
+      "agent": "claude"
+    },
+    {
+      "src": "claude/rules.evidence.md",
+      "dest": ".claude/rules/evidence.md",
+      "strategy": "create",
+      "agent": "claude"
+    },
+    {
+      "src": "claude/verify/SKILL.md",
+      "dest": ".claude/skills/verify/SKILL.md",
+      "strategy": "create",
+      "agent": "claude"
+    },
+    {
+      "src": "agent-setup.md",
+      "dest": ".harness/docs/agents.md",
+      "strategy": "create",
+      "agent": [
+        "codex",
+        "cursor",
+        "gemini",
+        "copilot",
+        "opencode"
+      ]
+    },
+    {
+      "src": "claude/verify/SKILL.md",
+      "dest": ".agents/skills/verify/SKILL.md",
+      "strategy": "create",
+      "agent": [
+        "codex",
+        "cursor",
+        "gemini",
+        "copilot",
+        "opencode"
+      ]
+    },
+    {
+      "src": "codex/hooks.json",
+      "dest": ".codex/hooks.json",
+      "strategy": "json-merge",
+      "agent": "codex"
+    },
+    {
+      "src": "cursor/hooks.json",
+      "dest": ".cursor/hooks.json",
+      "strategy": "json-merge",
+      "agent": "cursor"
+    },
+    {
+      "src": "gemini/settings.hooks.json",
+      "dest": ".gemini/settings.json",
+      "strategy": "json-merge",
+      "agent": "gemini"
+    },
+    {
+      "src": "copilot/harness.json",
+      "dest": ".github/hooks/harness.json",
+      "strategy": "json-merge",
+      "agent": "copilot"
+    }
+  ]
+}

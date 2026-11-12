@@ -1,0 +1,306 @@
+# Agent pull request review (harness rung 4, first loop).
+#
+# Lanes:
+#   gate     no model, read-only: kill switch, resolves the PR from the API and
+#            checks that its author has write access.
+#   review   model key, read-only token: the agent runs on the trusted base
+#            checkout; the PR head sits in pr-head/ as data and is never executed.
+#   publish  no model key, pull-requests: write: validates the agent's JSON with
+#            .harness/bin/agent-output.py and posts one review comment.
+#
+# Who can trigger: pull_request_target runs for every PR, but the gate job only
+# passes PRs that are open, not draft, and whose author has admin or write
+# permission (REST: collaborators/{login}/permission). workflow_dispatch needs
+# write access to start, and it gets the same PR-author check (drafts allowed),
+# so dispatch cannot be used to review an outside author's PR with the key.
+# The agent action also rejects actors without write access on its own.
+#
+# Kill switch: set the repository variable AGENT_ENABLED to anything other than
+# "true" and no job starts; jobs already queued fail at their first step.
+# Setup and rollback: .harness/docs/first-loop.md
+
+name: agent-review
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to review
+        required: true
+        type: number
+
+permissions: {}
+
+concurrency:
+  group: agent-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    if: vars.AGENT_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      eligible: ${{ steps.pr.outputs.eligible }}
+      pr_number: ${{ steps.pr.outputs.pr_number }}
+      base_sha: ${{ steps.pr.outputs.base_sha }}
+      head_sha: ${{ steps.pr.outputs.head_sha }}
+    steps:
+      - name: Kill switch (vars.AGENT_ENABLED)
+        env:
+          AGENT_ENABLED: ${{ vars.AGENT_ENABLED }}
+        run: |
+          if [ "${AGENT_ENABLED:-}" != "true" ]; then
+            echo "::error::AGENT_ENABLED is not 'true'; agent workflows are paused."
+            exit 1
+          fi
+
+      - name: Resolve pull request and check author access
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          case "$PR_NUMBER" in ''|*[!0-9]*) echo "::error::invalid PR number"; exit 1 ;; esac
+          gh api "repos/$REPO/pulls/$PR_NUMBER" > pr.json
+          state="$(jq -r '.state' pr.json)"
+          draft="$(jq -r '.draft' pr.json)"
+          author="$(jq -r '.user.login' pr.json)"
+          eligible=false
+          # A dispatch may target a draft, but the author check applies to
+          # every trigger: a maintainer dispatching a review of an outside PR
+          # would otherwise feed untrusted text to an agent holding the key.
+          if [ "$state" = "open" ] && { [ "$EVENT_NAME" = "workflow_dispatch" ] || [ "$draft" = "false" ]; }; then
+            # Fails closed: any API error reads as "none".
+            perm="$(gh api "repos/$REPO/collaborators/$author/permission" --jq '.permission' 2>/dev/null || echo none)"
+            echo "author permission: $perm"
+            case "$perm" in admin|write) eligible=true ;; esac
+            # The implement loop's own PRs are authored by the Actions bot, which
+            # has no collaborator permission. Accept them on dispatch only, and
+            # only from an agent/issue-* branch in this repository (a fork cannot
+            # author a PR as the bot, and those branches come from issues that a
+            # listed maintainer approved).
+            if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$author" = "github-actions[bot]" ] \
+               && [ "$(jq -r '.head.repo.full_name' pr.json)" = "$REPO" ]; then
+              case "$(jq -r '.head.ref' pr.json)" in agent/issue-*) eligible=true ;; esac
+            fi
+          fi
+          {
+            echo "eligible=$eligible"
+            echo "pr_number=$PR_NUMBER"
+            echo "base_sha=$(jq -r '.base.sha' pr.json)"
+            echo "head_sha=$(jq -r '.head.sha' pr.json)"
+          } >> "$GITHUB_OUTPUT"
+          echo "eligible=$eligible"
+
+  review:
+    needs: gate
+    if: vars.AGENT_ENABLED == 'true' && needs.gate.outputs.eligible == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+      # id-token: write   # only when authenticating the model with OIDC / workload identity federation
+    env:
+      PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
+      BASE_SHA: ${{ needs.gate.outputs.base_sha }}
+      HEAD_SHA: ${{ needs.gate.outputs.head_sha }}
+    steps:
+      - name: Kill switch (vars.AGENT_ENABLED)
+        env:
+          AGENT_ENABLED: ${{ vars.AGENT_ENABLED }}
+        run: |
+          if [ "${AGENT_ENABLED:-}" != "true" ]; then
+            echo "::error::AGENT_ENABLED is not 'true'; agent workflows are paused."
+            exit 1
+          fi
+
+      - name: Check out trusted base revision (workspace root)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.gate.outputs.base_sha }}
+          persist-credentials: false
+
+      - name: Check out PR head as data (pr-head/, never executed)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.gate.outputs.head_sha }}
+          path: pr-head
+          persist-credentials: false
+          # Needed for fork PRs from write-access authors. Safe here only because
+          # no step runs code from pr-head/ and the agent has no shell tool.
+          allow-unsafe-pr-checkout: true
+
+      - name: Remove agent instruction files from the PR head
+        # A nested CLAUDE.md / AGENTS.md / skill dir would be loaded as
+        # instructions when the agent reads files there. Their changes stay
+        # visible to the reviewer through pr-data/diff.patch.
+        run: |
+          set -euo pipefail
+          find pr-head \( -name .git -prune \) -o \( \
+            -name CLAUDE.md -o -name CLAUDE.local.md -o -name AGENTS.md -o -name GEMINI.md \
+            -o -name .claude -o -name .codex -o -name .cursor -o -name .gemini -o -name .agents \
+            -o -name .mcp.json -o -name opencode.json -o -name copilot-instructions.md \) \
+            -prune -exec rm -rf {} +
+          # A symlink in the PR head could point the agent's Read at files
+          # outside pr-head/ (the runner, the base checkout); drop them all.
+          find pr-head -path pr-head/.git -prune -o -type l -exec rm -f {} +
+
+      - name: Prepare PR data (untrusted, sanitized)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p pr-data
+          gh api "repos/$REPO/pulls/$PR_NUMBER" > "$RUNNER_TEMP/pr.json"
+          test "$(jq -r '.head.sha' "$RUNNER_TEMP/pr.json")" = "$HEAD_SHA" || { echo "::error::PR head moved; a newer run will review it"; exit 1; }
+          gh api -H "Accept: application/vnd.github.v3.diff" "repos/$REPO/pulls/$PR_NUMBER" \
+            | python3 .harness/bin/strip-hidden.py --max-chars 400000 > pr-data/diff.patch
+          gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files?per_page=100" --jq '.[].filename' > pr-data/changed-files.txt
+          jq -r '"# " + (.title // "") + "\n\n" + (.body // "(no description)")' "$RUNNER_TEMP/pr.json" \
+            | python3 .harness/bin/strip-hidden.py --max-chars 20000 > pr-data/description.md
+          gh api "repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100" \
+            --jq '.check_runs[] | "\(.name): \(.status) \(.conclusion // "pending")"' \
+            | python3 .harness/bin/strip-hidden.py --max-chars 10000 > pr-data/checks.txt || echo "check runs unavailable" > pr-data/checks.txt
+          wc -c pr-data/*
+
+      - name: Build prompt from trusted files
+        id: prompt
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          delim="EOF_$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+          {
+            echo "text<<$delim"
+            cat .harness/prompts/review.md
+            printf '\nRepository: %s\nPull request: #%s\nBase SHA: %s\nHead SHA: %s\n' "$REPO" "$PR_NUMBER" "$BASE_SHA" "$HEAD_SHA"
+            echo "$delim"
+            echo "schema=$(jq -c . .harness/schemas/review.schema.json)"
+          } >> "$GITHUB_OUTPUT"
+          mkdir -p agent-out
+
+      # ===== AGENT STEP (adapter: claude) ==================================
+      # The only vendor-specific step. Contract for a replacement step:
+      #   - id: agent; read-only tools; no shell; no network fetch tools
+      #   - prompt: steps.prompt.outputs.text; result JSON must match
+      #     .harness/schemas/review.schema.json (steps.prompt.outputs.schema)
+      #   - deliver the JSON as output `structured_output` or write it to
+      #     agent-out/result.json
+      #   - turn cap and the job's timeout-minutes bound the spend
+      # Credentials (claude adapter): secret ANTHROPIC_API_KEY. Alternatives:
+      # claude_code_oauth_token with secret CLAUDE_CODE_OAUTH_TOKEN, or OIDC via
+      # anthropic_federation_rule_id + anthropic_organization_id (needs id-token: write).
+      - name: Run agent (claude-code-action)
+        id: agent
+        uses: anthropics/claude-code-action@4fa93a88de49bbef68b10eb15aabedf28ca0e1ed # v1.0.271
+        env:
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Job-scoped read-only token instead of the app token, so the agent's
+          # built-in GitHub tools cannot write anything.
+          github_token: ${{ github.token }}
+          prompt: ${{ steps.prompt.outputs.text }}
+          # The Claude process holds the model credential. The Read deny rules
+          # (which Claude Code also applies to Grep and Glob; a Grep(path) or
+          # Glob(path) rule would be accepted but never match) keep the agent
+          # out of /proc (process environment), the runner temp dir and
+          # ~/.claude. `//` marks an absolute path in permission rules.
+          claude_args: >-
+            --max-turns 25
+            --allowedTools "Read,Grep,Glob"
+            --disallowedTools "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Read(//proc/**),Read(/${{ runner.temp }}/**),Read(~/.claude/**)"
+            --json-schema '${{ steps.prompt.outputs.schema }}'
+      # ===== END AGENT STEP ================================================
+
+      - name: Collect and pre-validate agent output
+        env:
+          RESULT: ${{ steps.agent.outputs.structured_output }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p review-out
+          if [ -n "${RESULT:-}" ]; then
+            printf '%s' "$RESULT" > review-out/findings.json
+          elif [ -f agent-out/result.json ] && [ ! -L agent-out/result.json ]; then
+            cp agent-out/result.json review-out/findings.json
+          else
+            echo "::error::agent produced no structured result"; exit 1
+          fi
+          python3 .harness/bin/agent-output.py review --input review-out/findings.json \
+            --changed-files pr-data/changed-files.txt --run-url "$RUN_URL" --out review-out/preview.md
+
+      - name: Upload findings
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: agent-review-${{ needs.gate.outputs.pr_number }}
+          path: review-out/findings.json
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [gate, review]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    env:
+      PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
+      BASE_SHA: ${{ needs.gate.outputs.base_sha }}
+      HEAD_SHA: ${{ needs.gate.outputs.head_sha }}
+    steps:
+      - name: Kill switch (vars.AGENT_ENABLED)
+        env:
+          AGENT_ENABLED: ${{ vars.AGENT_ENABLED }}
+        run: |
+          if [ "${AGENT_ENABLED:-}" != "true" ]; then
+            echo "::error::AGENT_ENABLED is not 'true'; agent workflows are paused."
+            exit 1
+          fi
+
+      - name: Check out trusted base revision (validator only)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.gate.outputs.base_sha }}
+          persist-credentials: false
+          sparse-checkout: .harness
+
+      - name: Download findings
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: agent-review-${{ needs.gate.outputs.pr_number }}
+          path: review-out
+
+      - name: Validate, render and post one review comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/pulls/$PR_NUMBER" > current.json
+          if [ "$(jq -r '.head.sha' current.json)" != "$HEAD_SHA" ]; then
+            echo "::notice::PR head moved since review; not publishing a stale review."
+            exit 0
+          fi
+          # Re-fetch the changed-file list here instead of trusting the review job.
+          gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files?per_page=100" --jq '.[].filename' > changed-files.txt
+          python3 .harness/bin/agent-output.py review --input review-out/findings.json \
+            --changed-files changed-files.txt --run-url "$RUN_URL" --out body.md
+          gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" -f event=COMMENT -f commit_id="$HEAD_SHA" -F body=@body.md > /dev/null
+          gh api "repos/$REPO/issues/$PR_NUMBER/labels" -f "labels[]=agent:reviewed" > /dev/null
+          echo "Posted review for #$PR_NUMBER at $HEAD_SHA"

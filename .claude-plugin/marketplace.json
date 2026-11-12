@@ -1,0 +1,7 @@
+{
+  "name": "harness-factory",
+  "owner": { "name": "harness-factory contributors" },
+  "plugins": [
+    { "name": "harness-factory", "source": "./" }
+  ]
+}

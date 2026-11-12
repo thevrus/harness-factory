@@ -1,0 +1,85 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(gh pr merge *)",
+      "Bash(gh pr review * --approve *)",
+      "Bash(gh pr review * --approve)",
+      "Bash(gh api *merge*)",
+      "Bash(git push * {{default_branch}})",
+      "Bash(git push * {{default_branch}} *)",
+      "Bash(git push * +{{default_branch}})",
+      "Bash(git push * +{{default_branch}} *)",
+      "Bash(git push *:{{default_branch}})",
+      "Bash(git push *:{{default_branch}} *)",
+      "Bash(git push *:refs/heads/{{default_branch}})",
+      "Bash(git push *:refs/heads/{{default_branch}} *)",
+      "Bash(git push * refs/heads/{{default_branch}})",
+      "Bash(git push * refs/heads/{{default_branch}} *)",
+      "Bash(git push --all *)",
+      "Bash(git push * --all)",
+      "Bash(git push * --all *)",
+      "Bash(git push --mirror *)",
+      "Bash(git push * --mirror)",
+      "Bash(git push * --mirror *)",
+      "Edit(/.harness/acceptance/**)"
+    ],
+    "ask": [
+      "Bash(gh variable set *AGENT_ENABLED*)",
+      "Bash(gh variable delete *AGENT_ENABLED*)",
+      "Bash(gh api *variables*)",
+      "Bash(gh issue edit *agent:ready*)",
+      "Bash(gh issue create *agent:ready*)",
+      "Bash(gh api *issues/*agent:ready*)",
+      "Bash(gh workflow run *agent-*)",
+      "Bash(gh workflow enable *agent-*)",
+      "Bash(gh api *actions/workflows/agent-*)",
+      "Edit(/.harness/**)",
+      "Edit(/.github/workflows/**)",
+      "Edit(/.claude/**)",
+      "Edit(CLAUDE.md)",
+      "Edit(AGENTS.md)",
+      "Edit(/.mcp.json)",
+      "Edit(/CODEOWNERS)",
+      "Edit(/.github/CODEOWNERS)",
+      "Edit(/docs/CODEOWNERS)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.harness/hooks/protect-paths.sh",
+            "args": [
+              "--agent",
+              "claude"
+            ],
+            "timeout": 30,
+            "onFailure": "block"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.harness/hooks/guard-bash.sh",
+            "args": [
+              "--agent",
+              "claude"
+            ],
+            "timeout": 30,
+            "onFailure": "block"
+          }
+        ]
+      }
+    ]
+  },
+  "sandbox": {
+    "autoAllowBashIfSandboxed": false,
+    "allowUnsandboxedCommands": false
+  }
+}

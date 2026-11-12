@@ -1,0 +1,29 @@
+{
+  "hooks": {
+    "AfterTool": [
+      {
+        "matcher": "write_file|replace",
+        "hooks": [
+          {
+            "type": "command",
+            "name": "harness-mark-dirty",
+            "command": "\"$GEMINI_PROJECT_DIR/.harness/hooks/mark-dirty.sh\" --agent gemini",
+            "timeout": 10000
+          }
+        ]
+      }
+    ],
+    "AfterAgent": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "name": "harness-require-evidence",
+            "command": "\"$GEMINI_PROJECT_DIR/.harness/hooks/require-evidence.sh\" --agent gemini",
+            "timeout": 120000
+          }
+        ]
+      }
+    ]
+  }
+}

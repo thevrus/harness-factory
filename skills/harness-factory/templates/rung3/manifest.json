@@ -1,0 +1,102 @@
+{
+  "rung": 3,
+  "name": "Guarded",
+  "requires_config": [
+    "default_branch",
+    "max_diff_lines"
+  ],
+  "files": [
+    {
+      "src": "protected-paths.txt",
+      "dest": ".harness/protected-paths.txt",
+      "strategy": "create"
+    },
+    {
+      "src": "harness_guard.py",
+      "dest": ".harness/bin/harness_guard.py",
+      "mode": "0755",
+      "strategy": "create"
+    },
+    {
+      "src": "diff-guard.sh",
+      "dest": ".harness/bin/diff-guard.sh",
+      "mode": "0755",
+      "strategy": "create"
+    },
+    {
+      "src": "lint-agent-workflows.py",
+      "dest": ".harness/bin/lint-agent-workflows.py",
+      "mode": "0755",
+      "strategy": "create"
+    },
+    {
+      "src": "protect-paths.sh",
+      "dest": ".harness/hooks/protect-paths.sh",
+      "mode": "0755",
+      "strategy": "create"
+    },
+    {
+      "src": "guard-bash.sh",
+      "dest": ".harness/hooks/guard-bash.sh",
+      "mode": "0755",
+      "strategy": "create"
+    },
+    {
+      "src": "acceptance-README.md",
+      "dest": ".harness/acceptance/README.md",
+      "strategy": "create"
+    },
+    {
+      "src": "branch-protection.md",
+      "dest": ".harness/docs/branch-protection.md",
+      "strategy": "create"
+    },
+    {
+      "src": "harness-guard.yml",
+      "dest": ".github/workflows/harness-guard.yml",
+      "strategy": "create"
+    },
+    {
+      "src": "settings.fragment.json",
+      "dest": ".claude/settings.json",
+      "strategy": "json-merge",
+      "agent": "claude"
+    },
+    {
+      "src": "codex/hooks.json",
+      "dest": ".codex/hooks.json",
+      "strategy": "json-merge",
+      "agent": "codex"
+    },
+    {
+      "src": "codex/harness.rules",
+      "dest": ".codex/rules/harness.rules",
+      "strategy": "create",
+      "agent": "codex"
+    },
+    {
+      "src": "cursor/hooks.json",
+      "dest": ".cursor/hooks.json",
+      "strategy": "json-merge",
+      "agent": "cursor"
+    },
+    {
+      "src": "cursor/cli.json",
+      "dest": ".cursor/cli.json",
+      "strategy": "json-merge",
+      "agent": "cursor"
+    },
+    {
+      "src": "gemini/settings.hooks.json",
+      "dest": ".gemini/settings.json",
+      "strategy": "json-merge",
+      "agent": "gemini"
+    },
+    {
+      "src": "copilot/harness.json",
+      "dest": ".github/hooks/harness.json",
+      "strategy": "json-merge",
+      "agent": "copilot"
+    }
+  ]
+}

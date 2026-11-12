@@ -1,0 +1,7 @@
+# Labels the triage write lane may apply. One per line; '#' starts a comment.
+# The write lane rejects the whole triage result if it asks for any label not
+# listed here. Edit through a reviewed pull request.
+agent:ready
+agent:needs-spec
+agent:needs-info
+agent:parked

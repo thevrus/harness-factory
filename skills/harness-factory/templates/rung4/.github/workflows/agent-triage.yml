@@ -1,0 +1,323 @@
+# Agent issue triage (harness rung 4, first loop).
+#
+# Lanes:
+#   select    no model, read-only: kill switch, picks one untriaged issue,
+#             strips hidden content and packages it as data.
+#   classify  model key, read-only token: the agent reads the issue file and
+#             emits {labels, comment, reason}. It cannot write anything.
+#   apply     no model key, issues: write: validates the result against
+#             .harness/triage-labels.txt (whole result rejected on any label
+#             outside it), applies at most TRIAGE_MAX_LABELS labels plus
+#             agent:triaged, and posts at most one comment.
+#   mark-failed  no model key, issues: write: when classify or apply failed
+#             (result rejected, schema miss, error), labels the issue
+#             agent:triage-failed and posts one fixed-text comment, so the next
+#             sweep moves past it instead of retrying it every hour. That label
+#             is not in .harness/triage-labels.txt, so the agent cannot choose it.
+#
+# Why a schedule instead of `issues: opened`: issue authors usually lack write
+# access, and the agent action refuses such actors unless
+# allowed_non_write_users is set, which the harness forbids. A scheduled sweep
+# has no external actor and processes one issue per run, which also caps spend.
+#
+# A label applied here uses the job's GITHUB_TOKEN, so it starts no other
+# workflow. That is deliberate: agent:ready set by triage is a recommendation;
+# only a listed maintainer can start implementation (rung 5).
+#
+# Kill switch: repository variable AGENT_ENABLED must be "true".
+# Setup and rollback: .harness/docs/first-loop.md
+
+name: agent-triage
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: Issue number to triage (empty = oldest untriaged)
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: agent-triage
+  cancel-in-progress: false
+
+env:
+  TRIAGE_MAX_LABELS: "2"
+
+jobs:
+  select:
+    if: vars.AGENT_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      issue: ${{ steps.pick.outputs.issue }}
+      default_branch: ${{ steps.branch.outputs.name }}
+    steps:
+      - name: Kill switch (vars.AGENT_ENABLED)
+        env:
+          AGENT_ENABLED: ${{ vars.AGENT_ENABLED }}
+        run: |
+          if [ "${AGENT_ENABLED:-}" != "true" ]; then
+            echo "::error::AGENT_ENABLED is not 'true'; agent workflows are paused."
+            exit 1
+          fi
+
+      - name: Resolve default branch
+        id: branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: echo "name=$(gh api "repos/$REPO" --jq '.default_branch')" >> "$GITHUB_OUTPUT"
+
+      - name: Check out default branch (allowlist and scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.branch.outputs.name }}
+          persist-credentials: false
+          sparse-checkout: .harness
+
+      - name: Pick one issue and package it as data
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REQUESTED: ${{ inputs.issue }}
+        run: |
+          set -euo pipefail
+          labels="$(grep -v '^[[:space:]]*#' .harness/triage-labels.txt | sed 's/#.*//; s/[[:space:]]//g' | grep -v '^$')"
+          if [ -n "${REQUESTED:-}" ]; then
+            case "$REQUESTED" in *[!0-9]*) echo "::error::invalid issue number"; exit 1 ;; esac
+            n="$REQUESTED"
+          else
+            # agent:triage-failed is excluded too: a rejected result would
+            # otherwise pick the same issue every run and block the queue.
+            q="repo:$REPO is:issue is:open -label:\"agent:triaged\" -label:\"agent:triage-failed\""
+            for l in $labels; do q="$q -label:\"$l\""; done
+            n="$(gh api -X GET search/issues -f q="$q" -f sort=created -f order=asc -f per_page=1 --jq '.items[0].number // empty')"
+          fi
+          if [ -z "$n" ]; then
+            echo "No untriaged issues."; echo "issue=" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          gh api "repos/$REPO/issues/$n" > issue.json
+          if [ "$(jq -r '.pull_request != null' issue.json)" = "true" ] || [ "$(jq -r '.state' issue.json)" != "open" ]; then
+            echo "#$n is not an open issue."; echo "issue=" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          mkdir -p triage-input
+          jq -r '"# " + (.title // "") + "\n\nAuthor association: " + (.author_association // "NONE") + "\n\n" + (.body // "(empty body)")' issue.json \
+            | python3 .harness/bin/strip-hidden.py --max-chars 20000 > triage-input/issue.md
+          printf '%s\n' $labels > triage-input/allowed-labels.txt
+          echo "issue=$n" >> "$GITHUB_OUTPUT"
+
+      - name: Upload issue data
+        if: steps.pick.outputs.issue != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: triage-input
+          path: triage-input/
+          if-no-files-found: error
+          retention-days: 3
+
+  classify:
+    needs: select
+    if: vars.AGENT_ENABLED == 'true' && needs.select.outputs.issue != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: read
+      # id-token: write   # only when authenticating the model with OIDC / workload identity federation
+    env:
+      ISSUE: ${{ needs.select.outputs.issue }}
+    steps:
+      - name: Kill switch (vars.AGENT_ENABLED)
+        env:
+          AGENT_ENABLED: ${{ vars.AGENT_ENABLED }}
+        run: |
+          if [ "${AGENT_ENABLED:-}" != "true" ]; then
+            echo "::error::AGENT_ENABLED is not 'true'; agent workflows are paused."
+            exit 1
+          fi
+
+      - name: Check out default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.select.outputs.default_branch }}
+          persist-credentials: false
+
+      - name: Download issue data
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: triage-input
+          path: triage-input
+
+      - name: Build prompt from trusted files
+        id: prompt
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          delim="EOF_$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+          {
+            echo "text<<$delim"
+            cat .harness/prompts/triage.md
+            printf '\nRepository: %s\nIssue: #%s (text in triage-input/issue.md)\n' "$REPO" "$ISSUE"
+            echo "$delim"
+            echo "schema=$(jq -c . .harness/schemas/triage.schema.json)"
+          } >> "$GITHUB_OUTPUT"
+          mkdir -p agent-out
+
+      # ===== AGENT STEP (adapter: claude) ==================================
+      # The only vendor-specific step. Contract for a replacement step:
+      #   - id: agent; tools limited to reading files; no shell, no network
+      #   - prompt: steps.prompt.outputs.text; result JSON must match
+      #     .harness/schemas/triage.schema.json (steps.prompt.outputs.schema)
+      #   - deliver the JSON as output `structured_output` or write it to
+      #     agent-out/result.json
+      # Credentials (claude adapter): secret ANTHROPIC_API_KEY. Alternatives:
+      # claude_code_oauth_token with secret CLAUDE_CODE_OAUTH_TOKEN, or OIDC via
+      # anthropic_federation_rule_id + anthropic_organization_id (needs id-token: write).
+      - name: Run agent (claude-code-action)
+        id: agent
+        uses: anthropics/claude-code-action@4fa93a88de49bbef68b10eb15aabedf28ca0e1ed # v1.0.271
+        env:
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          prompt: ${{ steps.prompt.outputs.text }}
+          # The Claude process holds the model credential. The Read deny rules
+          # (which Claude Code also applies to Grep and Glob) keep the agent out
+          # of /proc (process environment), the runner temp dir and ~/.claude.
+          # `//` marks an absolute path in permission rules; runner.temp is
+          # absolute, so `/${{ runner.temp }}` renders as //home/runner/work/_temp.
+          claude_args: >-
+            --max-turns 6
+            --allowedTools "Read"
+            --disallowedTools "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Read(//proc/**),Read(/${{ runner.temp }}/**),Read(~/.claude/**)"
+            --json-schema '${{ steps.prompt.outputs.schema }}'
+      # ===== END AGENT STEP ================================================
+
+      - name: Collect and pre-validate agent output
+        env:
+          RESULT: ${{ steps.agent.outputs.structured_output }}
+        run: |
+          set -euo pipefail
+          mkdir -p triage-out
+          if [ -n "${RESULT:-}" ]; then
+            printf '%s' "$RESULT" > triage-out/result.json
+          elif [ -f agent-out/result.json ] && [ ! -L agent-out/result.json ]; then
+            cp agent-out/result.json triage-out/result.json
+          else
+            echo "::error::agent produced no structured result"; exit 1
+          fi
+          python3 .harness/bin/agent-output.py triage --input triage-out/result.json \
+            --max-labels "$TRIAGE_MAX_LABELS" --labels-out /dev/null --comment-out /dev/null
+
+      - name: Upload triage result
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: triage-result
+          path: triage-out/result.json
+          if-no-files-found: error
+          retention-days: 7
+
+  apply:
+    needs: [select, classify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    env:
+      ISSUE: ${{ needs.select.outputs.issue }}
+    steps:
+      - name: Kill switch (vars.AGENT_ENABLED)
+        env:
+          AGENT_ENABLED: ${{ vars.AGENT_ENABLED }}
+        run: |
+          if [ "${AGENT_ENABLED:-}" != "true" ]; then
+            echo "::error::AGENT_ENABLED is not 'true'; agent workflows are paused."
+            exit 1
+          fi
+
+      - name: Check out default branch (allowlist and validator)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.select.outputs.default_branch }}
+          persist-credentials: false
+          sparse-checkout: .harness
+
+      - name: Download triage result
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: triage-result
+          path: triage-out
+
+      - name: Validate against allowlist and apply
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 .harness/bin/agent-output.py triage --input triage-out/result.json \
+            --allowlist .harness/triage-labels.txt --max-labels "$TRIAGE_MAX_LABELS" \
+            --run-url "$RUN_URL" --labels-out labels.txt --comment-out comment.md
+          if [ "$(gh api "repos/$REPO/issues/$ISSUE" --jq '.state')" != "open" ]; then
+            echo "::notice::#$ISSUE closed meanwhile; nothing applied."; exit 0
+          fi
+          args=(-f "labels[]=agent:triaged")
+          while IFS= read -r l; do [ -n "$l" ] && args+=(-f "labels[]=$l"); done < labels.txt
+          gh api "repos/$REPO/issues/$ISSUE/labels" "${args[@]}" > /dev/null
+          # A successful retry (dispatch with -f issue=N) clears an earlier failure.
+          gh api -X DELETE "repos/$REPO/issues/$ISSUE/labels/agent:triage-failed" > /dev/null 2>&1 || true
+          gh api "repos/$REPO/issues/$ISSUE/comments" -F body=@comment.md > /dev/null
+          echo "Triaged #$ISSUE: $(tr '\n' ' ' < labels.txt)"
+
+  mark-failed:
+    # Runs only when classify or apply failed for a selected issue. No model
+    # secret here, and the comment is fixed text: nothing from the agent result
+    # is read or posted.
+    needs: [select, classify, apply]
+    if: >-
+      always() && vars.AGENT_ENABLED == 'true' && needs.select.outputs.issue != '' &&
+      (needs.classify.result == 'failure' || needs.apply.result == 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      ISSUE: ${{ needs.select.outputs.issue }}
+    steps:
+      - name: Kill switch (vars.AGENT_ENABLED)
+        env:
+          AGENT_ENABLED: ${{ vars.AGENT_ENABLED }}
+        run: |
+          if [ "${AGENT_ENABLED:-}" != "true" ]; then
+            echo "::error::AGENT_ENABLED is not 'true'; agent workflows are paused."
+            exit 1
+          fi
+
+      - name: Label agent:triage-failed and post a fixed note
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          case "$ISSUE" in ''|*[!0-9]*) echo "::error::invalid issue number"; exit 1 ;; esac
+          if [ "$(gh api "repos/$REPO/issues/$ISSUE" --jq '.state')" != "open" ]; then
+            echo "::notice::#$ISSUE closed meanwhile; nothing marked."; exit 0
+          fi
+          gh api "repos/$REPO/issues/$ISSUE/labels" -f "labels[]=agent:triage-failed" > /dev/null
+          printf 'Automated triage could not classify this issue; a maintainer will triage it by hand.\n\nAgent-Run: %s\n' \
+            "$RUN_URL" > note.md
+          gh api "repos/$REPO/issues/$ISSUE/comments" -F body=@note.md > /dev/null
+          echo "Marked #$ISSUE agent:triage-failed"
